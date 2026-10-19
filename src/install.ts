@@ -121,11 +121,20 @@ async function restoreSourceGroup(
   const ambiguous: string[] = [];
   const relocated: RestoreOutcome['relocated'] = [];
 
+  // When every entry knows its path, read just those SKILL.md files instead of
+  // walking the repository. That avoids parsing (and warning about) unrelated
+  // skills that happen to be broken.
+  const lockedPaths = Object.values(group.entries).map((entry) => entry.skillPath);
+  const skillPaths = lockedPaths.every((path): path is string => Boolean(path))
+    ? lockedPaths
+    : undefined;
+
   const details = await installFromSourceDetails(parseSource(group.installSource), {
     skills: [],
     agents,
     includeInternal: true,
     fullDepth: group.fullDepth,
+    ...(skillPaths && { skillPaths }),
     spinner: silentSpinner,
     select: async (skills, repoPaths) => {
       const selection = selectLockedSkills(

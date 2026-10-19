@@ -114,6 +114,29 @@ describe('experimental_install', () => {
     expect(installed('beta')).toBe(false);
   });
 
+  it('does not warn about broken skills elsewhere in the same repository', () => {
+    const repo = join(testDir, 'repo');
+    const source = createGitRepo(repo, [{ name: 'alpha' }]);
+
+    // An unrelated SKILL.md with invalid YAML. Restore knows the locked paths,
+    // so it must not parse (or warn about) this one.
+    mkdirSync(join(repo, 'skills', 'broken'), { recursive: true });
+    writeFileSync(
+      join(repo, 'skills', 'broken', 'SKILL.md'),
+      '---\nname: broken\ndescription: Pass: everything\n---\n'
+    );
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-m', 'broken skill']);
+
+    writeLock({ alpha: gitEntry(source, 'skills/alpha/SKILL.md') });
+
+    const result = runCli(['experimental_install'], testDir);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout + result.stderr).not.toContain('YAML parse error');
+    expect(installed('alpha')).toBe(true);
+  });
+
   it('reinstalls a skill that moved and updates its locked path', () => {
     const repo = join(testDir, 'repo');
     const source = createGitRepo(repo, [{ name: 'alpha' }]);

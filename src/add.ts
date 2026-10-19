@@ -7,7 +7,14 @@ import { parseSource, getOwnerRepo, parseOwnerRepo, isRepoPrivate } from './sour
 import { stripTerminalEscapes } from './sanitize.ts';
 import { searchMultiselect } from './prompts/search-multiselect.ts';
 import { cloneRepo, cleanupTempDir, GitCloneError } from './git.ts';
-import { discoverSkills, getSkillDisplayName, filterSkills } from './skills.ts';
+import {
+  discoverSkills,
+  getSkillDisplayName,
+  filterSkills,
+  hasSkillMd,
+  isSubpathSafe,
+  parseSkillMd,
+} from './skills.ts';
 import {
   installSkillForAgent,
   installBlobSkillForAgent,
@@ -1136,13 +1143,84 @@ interface ResolvedSkills {
   blobResult: BlobInstallResult | null;
 }
 
+interface SkillsAtPaths {
+  skills: Skill[];
+  missingPaths: string[];
+}
+
+/**
+ * Parse only the SKILL.md files recorded in the project lock.
+ *
+ * Full-repository discovery walks every skill folder and warns about any
+ * SKILL.md it cannot parse, including skills the caller never asked for.
+ * Restoring a lock knows the exact paths, so read just those.
+ */
+async function parseSkillsAtPaths(
+  rootDir: string,
+  skillPaths: string[],
+  includeInternal: boolean
+): Promise<SkillsAtPaths> {
+  const skills: Skill[] = [];
+  const missingPaths: string[] = [];
+
+  for (const skillPath of skillPaths) {
+    if (!isSubpathSafe(rootDir, skillPath)) {
+      missingPaths.push(skillPath);
+      continue;
+    }
+    const skillDir = dirname(join(rootDir, skillPath));
+    if (!(await hasSkillMd(skillDir))) {
+      missingPaths.push(skillPath);
+      continue;
+    }
+    const skill = await parseSkillMd(join(rootDir, skillPath), { includeInternal });
+    if (skill) skills.push(skill);
+  }
+
+  return { skills, missingPaths };
+}
+
+/**
+ * Load a source's skills, preferring exact locked paths and falling back to a
+ * full walk only when one of those paths no longer exists (a moved skill).
+ */
+async function loadSkills(
+  rootDir: string,
+  subpath: string | undefined,
+  options: { includeInternal: boolean; fullDepth?: boolean; skillPaths?: string[] },
+  spinner: InstallSpinner
+): Promise<Skill[]> {
+  const { includeInternal, skillPaths } = options;
+
+  if (!skillPaths || skillPaths.length === 0) {
+    spinner.start('Discovering skills…');
+    return discoverSkills(rootDir, subpath, {
+      includeInternal,
+      fullDepth: options.fullDepth,
+    });
+  }
+
+  spinner.start('Reading locked skills…');
+  const exact = await parseSkillsAtPaths(rootDir, skillPaths, includeInternal);
+  if (exact.missingPaths.length === 0) return exact.skills;
+
+  // A locked path is gone. Walk the repository so a skill that moved can be
+  // found again; exact-path skills keep precedence over same-named discoveries.
+  const discovered = await discoverSkills(rootDir, subpath, {
+    includeInternal,
+    fullDepth: true,
+  });
+  const names = new Set(exact.skills.map((skill) => skill.name));
+  return [...exact.skills, ...discovered.filter((skill) => !names.has(skill.name))];
+}
+
 /**
  * Fetch `parsed` (blob snapshot, clone, or download) and discover its skills.
  * Throws instead of exiting; removes its own temp dir when it throws.
  */
 async function resolveSkills(
   parsed: ParsedSource,
-  options: { includeInternal: boolean; fullDepth?: boolean },
+  options: { includeInternal: boolean; fullDepth?: boolean; skillPaths?: string[] },
   spinner: InstallSpinner
 ): Promise<ResolvedSkills> {
   const { includeInternal } = options;
@@ -1152,23 +1230,15 @@ async function resolveSkills(
 
   try {
     if (parsed.type === 'local') {
-      spinner.start('Discovering skills…');
-      skills = await discoverSkills(parsed.localPath!, parsed.subpath, {
-        includeInternal,
-        fullDepth: options.fullDepth,
-      });
+      skills = await loadSkills(parsed.localPath!, parsed.subpath, options, spinner);
     } else if (parsed.type === 'well-known' || parsed.type === 'download') {
       spinner.start('Downloading source...');
       const downloaded = await downloadSource(parsed.url);
       tempDir = downloaded.tempDir;
       spinner.stop(`Downloaded ${downloaded.kind === 'skill-md' ? 'SKILL.md file' : 'archive'}`);
 
-      spinner.start('Discovering skills...');
-      skills = await discoverSkills(downloaded.rootDir, parsed.subpath, {
-        includeInternal,
-        fullDepth: options.fullDepth,
-      });
-    } else if (parsed.type === 'github' && !options.fullDepth) {
+      skills = await loadSkills(downloaded.rootDir, parsed.subpath, options, spinner);
+    } else if (parsed.type === 'github' && !options.fullDepth && !options.skillPaths) {
       // Try the blob-based fast install for GitHub sources; skip for --full-depth.
       // Eligible per repo (a BLOB_ALLOWED_REPOS entry = self-hosted download URL) or
       // per owner (BLOB_ALLOWED_OWNERS = all their repos, skills.sh-hosted).
@@ -1203,11 +1273,7 @@ async function resolveSkills(
         tempDir = await cloneRepo(parsed.url, parsed.ref);
         spinner.stop('Repository cloned');
 
-        spinner.start('Discovering skills…');
-        skills = await discoverSkills(tempDir, parsed.subpath, {
-          includeInternal,
-          fullDepth: options.fullDepth,
-        });
+        skills = await loadSkills(tempDir, parsed.subpath, options, spinner);
       }
     } else {
       // GitLab, git URL, or --full-depth: always clone
@@ -1215,11 +1281,7 @@ async function resolveSkills(
       tempDir = await cloneRepo(parsed.url, parsed.ref);
       spinner.stop('Repository cloned');
 
-      spinner.start('Discovering skills…');
-      skills = await discoverSkills(tempDir, parsed.subpath, {
-        includeInternal,
-        fullDepth: options.fullDepth,
-      });
+      skills = await loadSkills(tempDir, parsed.subpath, options, spinner);
     }
   } catch (error) {
     await cleanup(tempDir);
@@ -1362,6 +1424,11 @@ export interface SourceInstallOptions {
   includeInternal?: boolean;
   /** Walk every directory instead of the known skill containers. */
   fullDepth?: boolean;
+  /**
+   * Repo-relative SKILL.md paths to read instead of walking the repository.
+   * A missing path falls back to a full walk so moved skills are still found.
+   */
+  skillPaths?: string[];
   /** Progress reporter; pass an inert spinner for silent batch installs. */
   spinner?: InstallSpinner;
 }
@@ -1384,6 +1451,7 @@ export async function installFromSourceDetails(
       {
         includeInternal: options.includeInternal ?? options.skills.length > 0,
         fullDepth: options.fullDepth,
+        skillPaths: options.skillPaths,
       },
       spinner
     );
