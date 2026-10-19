@@ -1,32 +1,55 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { runCli } from '../src/test-utils.ts';
+import type { LocalSkillLockEntry } from '../src/local-lock.ts';
 
 describe('experimental_install', () => {
   let testDir: string;
 
-  function writeSkill(dir: string, name: string): void {
+  function writeSkill(dir: string, name: string, extra?: string): void {
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, 'SKILL.md'),
       `---\nname: ${name}\ndescription: ${name}\n---\n# ${name}\n`
     );
+    if (extra) writeFileSync(join(dir, extra), 'extra\n');
   }
 
-  function writeLock(skills: Record<string, string>): void {
+  function writeLock(skills: Record<string, LocalSkillLockEntry>): void {
     writeFileSync(
       join(testDir, 'skills-lock.json'),
-      JSON.stringify({
-        version: 1,
-        skills: Object.fromEntries(
-          Object.entries(skills).map(([name, source]) => [
-            name,
-            { source, sourceType: 'local', computedHash: 'x' },
-          ])
-        ),
-      })
+      JSON.stringify({ version: 1, skills }, null, 2)
+    );
+  }
+
+  function localEntry(source: string, skillPath?: string): LocalSkillLockEntry {
+    return { source, sourceType: 'local', computedHash: 'x', ...(skillPath && { skillPath }) };
+  }
+
+  function gitEntry(source: string, skillPath: string): LocalSkillLockEntry {
+    return { source, sourceType: 'git', skillPath, computedHash: 'x' };
+  }
+
+  /** A local git repository with one skills/<name> folder per name; returns its file:// URL. */
+  function createGitRepo(root: string, skills: Array<{ name: string; folder?: string }>): string {
+    mkdirSync(root, { recursive: true });
+    git(root, ['init']);
+    for (const skill of skills) {
+      writeSkill(join(root, 'skills', skill.folder ?? skill.name), skill.name);
+    }
+    git(root, ['add', '.']);
+    git(root, ['commit', '-m', 'fixture']);
+    return `file://${root}`;
+  }
+
+  function git(cwd: string, args: string[]): void {
+    execFileSync(
+      'git',
+      ['-c', 'user.name=skills-test', '-c', 'user.email=test@example.com', ...args],
+      { cwd, stdio: 'ignore' }
     );
   }
 
@@ -48,7 +71,7 @@ describe('experimental_install', () => {
   it('restores every source in the lock', () => {
     writeSkill(join(testDir, 'src-a', 'alpha'), 'alpha');
     writeSkill(join(testDir, 'src-b', 'beta'), 'beta');
-    writeLock({ alpha: './src-a', beta: './src-b' });
+    writeLock({ alpha: localEntry('./src-a'), beta: localEntry('./src-b') });
 
     const result = runCli(['experimental_install'], testDir);
 
@@ -61,12 +84,66 @@ describe('experimental_install', () => {
 
   it('keeps restoring after a source fails', () => {
     writeSkill(join(testDir, 'src-b', 'beta'), 'beta');
-    writeLock({ alpha: './missing', beta: './src-b' });
+    writeLock({ alpha: localEntry('./missing'), beta: localEntry('./src-b') });
 
     const result = runCli(['experimental_install'], testDir);
 
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain('Failed to install from');
     expect(installed('beta')).toBe(true);
+  });
+
+  it('keeps restoring when a skill was deleted from its repository', () => {
+    const repo = join(testDir, 'repo');
+    const source = createGitRepo(repo, [{ name: 'alpha' }, { name: 'beta' }]);
+    writeLock({
+      alpha: gitEntry(source, 'skills/alpha/SKILL.md'),
+      beta: gitEntry(source, 'skills/beta/SKILL.md'),
+    });
+
+    rmSync(join(repo, 'skills', 'beta'), { recursive: true, force: true });
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-m', 'drop beta']);
+
+    const result = runCli(['experimental_install'], testDir);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('Missing upstream');
+    expect(result.stdout).toContain('beta');
+    expect(installed('alpha')).toBe(true);
+    expect(installed('beta')).toBe(false);
+  });
+
+  it('reinstalls a skill that moved and updates its locked path', () => {
+    const repo = join(testDir, 'repo');
+    const source = createGitRepo(repo, [{ name: 'alpha' }]);
+    writeLock({ alpha: gitEntry(source, 'skills/alpha/SKILL.md') });
+
+    execFileSync('git', ['mv', 'skills/alpha', 'skills/moved-alpha'], {
+      cwd: repo,
+      stdio: 'ignore',
+    });
+    git(repo, ['commit', '-m', 'move alpha']);
+
+    const result = runCli(['experimental_install'], testDir);
+
+    expect(result.exitCode).toBe(0);
+    expect(installed('alpha')).toBe(true);
+    const lock = JSON.parse(readFileSync(join(testDir, 'skills-lock.json'), 'utf-8'));
+    expect(lock.skills.alpha.skillPath).toBe('skills/moved-alpha/SKILL.md');
+  });
+
+  it('still cleans removed files from the canonical copy on reinstall', () => {
+    writeSkill(join(testDir, 'src-a', 'alpha'), 'alpha', 'notes.md');
+    writeLock({ alpha: localEntry('./src-a') });
+
+    expect(runCli(['experimental_install'], testDir).exitCode).toBe(0);
+    const installedNotes = join(testDir, '.agents', 'skills', 'alpha', 'notes.md');
+    expect(existsSync(installedNotes)).toBe(true);
+
+    rmSync(join(testDir, 'src-a', 'alpha', 'notes.md'));
+    expect(runCli(['experimental_install'], testDir).exitCode).toBe(0);
+
+    expect(existsSync(installedNotes)).toBe(false);
   });
 });

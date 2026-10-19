@@ -338,6 +338,19 @@ npx skills experimental_install
 ```
 
 Restore supported sources recorded in `skills-lock.json` into `.agents/skills/`.
+Each repository is fetched and discovered once, then its locked skills are
+installed from that single checkout. Independent repositories are restored
+concurrently (four at a time by default; set `SKILLS_INSTALL_CONCURRENCY` to
+change it).
+
+A skill that disappeared or moved upstream does not stop the restore:
+
+- A skill that moved inside its repository is found by name and its
+  `skillPath` is updated in the lock.
+- A skill that no longer exists is reported as missing, the remaining skills
+  still install, and the command exits non-zero so CI notices. Remove it with
+  `skills remove <name>` when you no longer need it.
+
 Entries from npm packages are synced from the dependencies already on disk, so
 install your npm dependencies before restoring. This command does not install
 npm packages or create agent-specific links for restored skills.

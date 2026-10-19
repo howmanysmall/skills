@@ -50,6 +50,7 @@ import {
 } from './skill-lock.ts';
 import {
   addSkillToLocalLock,
+  addSkillsToLocalLock,
   computeSkillFolderHash,
   type LocalSkillLockEntry,
 } from './local-lock.ts';
@@ -1121,7 +1122,12 @@ async function handleWellKnownSkills(
   return true;
 }
 
-type Spinner = ReturnType<typeof p.spinner>;
+/**
+ * Minimal spinner surface used by the programmatic install helpers. A clack
+ * spinner satisfies it; batch callers can pass a no-op implementation so
+ * sources can install concurrently without fighting over one spinner.
+ */
+export type InstallSpinner = Pick<ReturnType<typeof p.spinner>, 'start' | 'message' | 'stop'>;
 
 interface ResolvedSkills {
   skills: Skill[];
@@ -1137,7 +1143,7 @@ interface ResolvedSkills {
 async function resolveSkills(
   parsed: ParsedSource,
   options: { includeInternal: boolean; fullDepth?: boolean },
-  spinner: Spinner
+  spinner: InstallSpinner
 ): Promise<ResolvedSkills> {
   const { includeInternal } = options;
   let skills: Skill[];
@@ -1223,11 +1229,11 @@ async function resolveSkills(
   return { skills, tempDir, blobResult };
 }
 
-type TargetInstallResult = Awaited<ReturnType<typeof installSkillForAgent>> & {
+interface TargetInstallResult extends Awaited<ReturnType<typeof installSkillForAgent>> {
   skill: string;
   agent: string;
   pluginName?: string;
-};
+}
 
 /** Install every skill into every target. Failures are returned per skill × target. */
 async function installToTargets(
@@ -1242,6 +1248,10 @@ async function installToTargets(
 ): Promise<TargetInstallResult[]> {
   const results: TargetInstallResult[] = [];
   for (const skill of skills) {
+    // All agents in a batch read the same skill, so the canonical copy only
+    // needs to be written once. Agents sharing the canonical directory (the
+    // universal agents) are no-ops after that.
+    let canonicalWritten = false;
     for (const target of targets) {
       const { agent, subagent } = target;
       const installOptions = {
@@ -1249,6 +1259,7 @@ async function installToTargets(
         mode: options.mode,
         eveSubagent: subagent,
         createMissingAgentRoot: options.createMissingAgentRoot(agent),
+        reuseCanonicalCopy: options.mode === 'symlink' && canonicalWritten,
       };
       let result;
       if (resolved.blobResult && 'files' in skill) {
@@ -1273,6 +1284,9 @@ async function installToTargets(
         pluginName: skill.pluginName,
         ...result,
       });
+      if (result.success && result.canonicalPath) {
+        canonicalWritten = true;
+      }
     }
   }
   return results;
@@ -1329,6 +1343,105 @@ interface SourceInstallResult {
   error?: string;
 }
 
+export interface SourceInstallDetails extends SourceInstallResult {
+  /** Repo-relative SKILL.md path per installed skill (absent for local sources). */
+  repoPaths: Record<string, string>;
+  /** Content hash per installed skill, as recorded in skills-lock.json. */
+  hashes: Record<string, string>;
+}
+
+export interface SourceInstallOptions {
+  skills: string[];
+  agents: AgentType[];
+  /**
+   * Receives every discovered skill plus its repo-relative SKILL.md path.
+   * Return the skills to install; defaults to all of them.
+   */
+  select?: (skills: Skill[], repoPaths: Record<string, string>) => Promise<Skill[]>;
+  /** Discover internal skills; defaults to whether specific skills were requested. */
+  includeInternal?: boolean;
+  /** Walk every directory instead of the known skill containers. */
+  fullDepth?: boolean;
+  /** Progress reporter; pass an inert spinner for silent batch installs. */
+  spinner?: InstallSpinner;
+}
+
+/**
+ * Install skills from `parsed` without writing the project lock.
+ *
+ * Returns the installed names together with the repo-relative paths and source
+ * hashes a caller needs to update the lock once for a whole batch.
+ */
+export async function installFromSourceDetails(
+  parsed: ParsedSource,
+  options: SourceInstallOptions
+): Promise<SourceInstallDetails> {
+  const spinner = options.spinner ?? p.spinner();
+  let resolved: ResolvedSkills | null = null;
+  try {
+    resolved = await resolveSkills(
+      parsed,
+      {
+        includeInternal: options.includeInternal ?? options.skills.length > 0,
+        fullDepth: options.fullDepth,
+      },
+      spinner
+    );
+    let selected =
+      options.skills.length > 0 ? filterSkills(resolved.skills, options.skills) : resolved.skills;
+    if (selected.length === 0) {
+      spinner.stop(pc.red('No matching skills found'));
+      return {
+        installed: [],
+        failed: [],
+        repoPaths: {},
+        hashes: {},
+        error: 'No matching skills found',
+      };
+    }
+    spinner.stop(`Found ${pc.green(selected.length)} skill${selected.length > 1 ? 's' : ''}`);
+
+    // Collect paths for every discovered skill before selection so `select`
+    // can resolve the locked paths itself.
+    const repoPaths = getSkillRepoPaths(resolved, resolved.skills);
+    if (options.select) selected = await options.select(selected, repoPaths);
+
+    const results = await installToTargets(
+      resolved,
+      selected,
+      options.agents.map((agent) => ({ agent })),
+      { global: false, mode: 'symlink', createMissingAgentRoot: () => true }
+    );
+    const installed = new Set(results.filter((r) => r.success).map((r) => r.skill));
+    const hashes: Record<string, string> = {};
+    for (const skill of selected) {
+      if (!installed.has(getSkillDisplayName(skill))) continue;
+      try {
+        hashes[skill.name] = await sourceSkillHash(skill);
+      } catch {
+        // Keep the lock's existing hash when the source cannot be hashed.
+      }
+    }
+    return {
+      installed: [...installed],
+      failed: results.filter((r) => !r.success).map((r) => `${r.skill} → ${r.agent}: ${r.error}`),
+      repoPaths,
+      hashes,
+    };
+  } catch (error) {
+    spinner.stop(pc.red('Installation failed'));
+    return {
+      installed: [],
+      failed: [],
+      repoPaths: {},
+      hashes: {},
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    await cleanup(resolved?.tempDir ?? null);
+  }
+}
+
 /**
  * Install skills from `parsed` at project scope without prompting or exiting:
  * keep `skills` (all when empty), let `select` drop any, install into
@@ -1340,49 +1453,124 @@ export async function installFromSource(
     skills: string[];
     agents: AgentType[];
     via?: string;
-    select?: (skills: Skill[]) => Promise<Skill[]>;
+    select?: (skills: Skill[], repoPaths: Record<string, string>) => Promise<Skill[]>;
   }
 ): Promise<SourceInstallResult> {
-  const spinner = p.spinner();
-  let resolved: ResolvedSkills | null = null;
-  try {
-    resolved = await resolveSkills(parsed, { includeInternal: options.skills.length > 0 }, spinner);
-    let selected =
-      options.skills.length > 0 ? filterSkills(resolved.skills, options.skills) : resolved.skills;
-    if (selected.length === 0) {
-      spinner.stop(pc.red('No matching skills found'));
-      return { installed: [], failed: [], error: 'No matching skills found' };
+  const details = await installFromSourceDetails(parsed, options);
+  if (details.installed.length > 0) {
+    const entries: Record<string, LocalSkillLockEntry> = {};
+    for (const name of details.installed) {
+      const hash = details.hashes[name];
+      if (!hash) continue;
+      entries[name] = {
+        ...projectLockEntry(parsed, details.repoPaths[name], hash),
+        ...(options.via && { via: options.via }),
+      };
     }
-    spinner.stop(`Found ${pc.green(selected.length)} skill${selected.length > 1 ? 's' : ''}`);
-    if (options.select) selected = await options.select(selected);
+    await addSkillsToLocalLock(entries);
+  }
+  return { installed: details.installed, failed: details.failed, error: details.error };
+}
 
-    const results = await installToTargets(
-      resolved,
-      selected,
-      options.agents.map((agent) => ({ agent })),
-      { global: false, mode: 'symlink', createMissingAgentRoot: () => true }
-    );
-    const installed = new Set(results.filter((r) => r.success).map((r) => r.skill));
-    const repoPaths = getSkillRepoPaths(resolved, selected);
-    for (const skill of selected) {
-      if (!installed.has(getSkillDisplayName(skill))) continue;
-      const entry = projectLockEntry(parsed, repoPaths[skill.name], await sourceSkillHash(skill));
-      await addSkillToLocalLock(skill.name, { ...entry, ...(options.via && { via: options.via }) });
-    }
-    return {
-      installed: [...installed],
-      failed: results.filter((r) => !r.success).map((r) => `${r.skill} → ${r.agent}: ${r.error}`),
-    };
+export interface WellKnownRestoreResult {
+  installed: string[];
+  missing: string[];
+  ambiguous: string[];
+  failed: string[];
+  /** Provider digest per restored skill. */
+  digests: Record<string, string>;
+  /** Hash of the installed folder per restored skill. */
+  hashes: Record<string, string>;
+  error?: string;
+}
+
+/**
+ * Restore locked well-known skills from their published index without
+ * prompting or exiting. A skill that disappeared from the index is reported
+ * as missing so the caller can keep restoring everything else.
+ */
+export async function restoreWellKnownSkills(
+  url: string,
+  lockedNames: string[],
+  agentTypes: AgentType[],
+  options: { cwd?: string } = {}
+): Promise<WellKnownRestoreResult> {
+  const cwd = options.cwd || process.cwd();
+  const empty = {
+    installed: [],
+    missing: [],
+    ambiguous: [],
+    failed: [],
+    digests: {},
+    hashes: {},
+  };
+  let available: WellKnownSkill[];
+  try {
+    available = await wellKnownProvider.fetchAllSkills(url, { includeInternal: true });
   } catch (error) {
-    spinner.stop(pc.red('Installation failed'));
     return {
-      installed: [],
-      failed: [],
+      ...empty,
       error: error instanceof Error ? error.message : String(error),
     };
-  } finally {
-    await cleanup(resolved?.tempDir ?? null);
   }
+
+  const byName = new Map<string, WellKnownSkill[]>();
+  for (const skill of available) {
+    for (const key of new Set([skill.installName, skill.name])) {
+      const matches = byName.get(key) ?? [];
+      matches.push(skill);
+      byName.set(key, matches);
+    }
+  }
+
+  const selected: Array<[string, WellKnownSkill]> = [];
+  const missing: string[] = [];
+  const ambiguous: string[] = [];
+  for (const name of lockedNames) {
+    const candidates = byName.get(name) ?? [];
+    if (candidates.length === 0) {
+      missing.push(name);
+    } else if (candidates.length > 1) {
+      ambiguous.push(name);
+    } else {
+      selected.push([name, candidates[0]!]);
+    }
+  }
+
+  const installed: string[] = [];
+  const failed: string[] = [];
+  const digests: Record<string, string> = {};
+  const hashes: Record<string, string> = {};
+
+  for (const [name, skill] of selected) {
+    let canonicalDir: string | undefined;
+    let succeeded = false;
+    for (const agent of agentTypes) {
+      const result = await installWellKnownSkillForAgent(skill, agent, {
+        cwd,
+        mode: 'symlink',
+        reuseCanonicalCopy: succeeded && Boolean(canonicalDir),
+      });
+      if (result.success) {
+        succeeded = true;
+        canonicalDir = result.canonicalPath ?? canonicalDir;
+      } else {
+        failed.push(`${name} → ${agents[agent].displayName}: ${result.error ?? 'Unknown error'}`);
+      }
+    }
+    if (!succeeded) continue;
+    installed.push(name);
+    digests[name] = computeWellKnownSkillDigest(skill);
+    if (canonicalDir) {
+      try {
+        hashes[name] = await computeSkillFolderHash(canonicalDir);
+      } catch {
+        // Keep the lock's existing hash when the installed files cannot be read.
+      }
+    }
+  }
+
+  return { installed, missing, ambiguous, failed, digests, hashes };
 }
 
 /** Content hash of a skill at its source: the blob snapshot, or the folder on disk. */

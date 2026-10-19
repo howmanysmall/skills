@@ -200,9 +200,40 @@ export async function addSkillToLocalLock(
   entry: LocalSkillLockEntry,
   cwd?: string
 ): Promise<void> {
+  await addSkillsToLocalLock({ [skillName]: entry }, cwd);
+}
+
+/**
+ * Add or update several skill entries with a single read/write of the lock
+ * file. Entries that already match are skipped, so a no-op restore leaves
+ * skills-lock.json byte-for-byte unchanged.
+ *
+ * Returns whether the file was written.
+ */
+export async function addSkillsToLocalLock(
+  entries: Record<string, LocalSkillLockEntry>,
+  cwd?: string
+): Promise<boolean> {
   const lock = await readLocalLock(cwd);
-  lock.skills = { ...lock.skills, [skillName]: entry };
-  await writeLocalLock(lock, cwd);
+  let changed = false;
+
+  for (const [skillName, entry] of Object.entries(entries)) {
+    if (JSON.stringify(lock.skills[skillName]) === JSON.stringify(entry)) continue;
+    // defineProperty (unlike assignment) records names like "__proto__" as
+    // ordinary own keys instead of touching the prototype.
+    Object.defineProperty(lock.skills, skillName, {
+      value: entry,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    changed = true;
+  }
+
+  if (changed) {
+    await writeLocalLock(lock, cwd);
+  }
+  return changed;
 }
 
 /**
