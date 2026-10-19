@@ -44,6 +44,12 @@ interface InstallOptions {
   eveSubagent?: string;
   /** Create a missing agent-specific project root because the user selected this agent. */
   createMissingAgentRoot?: boolean;
+  /**
+   * Trust a canonical copy written earlier in the same install batch instead of
+   * deleting and recopying it for every additional agent targeting the same
+   * skill. Leave unset unless the caller has already installed this skill once.
+   */
+  reuseCanonicalCopy?: boolean;
 }
 
 interface InstallResult {
@@ -400,16 +406,18 @@ export async function installSkillForAgent(
           await copyDirectory(skill.path, canonicalDir, agentType);
         }
       } else {
-        // Symlink mode: copy to canonical location and symlink to agent location
-        await cleanAndCreateDirectory(canonicalDir);
-        await copyDirectory(skill.path, canonicalDir, agentType);
+        // Symlink mode: copy to canonical location and symlink to agent location.
+        // Reuse the copy when another agent in this batch already wrote it.
+        if (!(options.reuseCanonicalCopy && existsSync(canonicalDir))) {
+          await cleanAndCreateDirectory(canonicalDir);
+          await copyDirectory(skill.path, canonicalDir, agentType);
+        }
       }
     }
 
-    // For universal agents with global install, the skill is already in the canonical
-    // ~/.agents/skills directory. Skip creating a symlink to the agent-specific global dir
-    // (e.g. ~/.copilot/skills) to avoid duplicates.
-    if (isGlobal && isUniversalAgent(agentType)) {
+    // Universal agents share the canonical directory, so there is no second
+    // location to link. This also covers global installs and Eve subagents.
+    if (resolve(agentDir) === resolve(canonicalDir)) {
       return {
         success: true,
         path: canonicalDir,
@@ -812,7 +820,13 @@ export async function installRemoteSkillForAgent(
 export async function installWellKnownSkillForAgent(
   skill: WellKnownSkill,
   agentType: AgentType,
-  options: { global?: boolean; cwd?: string; mode?: InstallMode; eveSubagent?: string } = {}
+  options: {
+    global?: boolean;
+    cwd?: string;
+    mode?: InstallMode;
+    eveSubagent?: string;
+    reuseCanonicalCopy?: boolean;
+  } = {}
 ): Promise<InstallResult> {
   const agent = agents[agentType];
   const isGlobal = options.global ?? false;
@@ -904,12 +918,16 @@ export async function installWellKnownSkillForAgent(
       };
     }
 
-    // Symlink mode: write to canonical location and symlink to agent location
-    await cleanAndCreateDirectory(canonicalDir);
-    await writeSkillFiles(canonicalDir);
+    // Symlink mode: write to canonical location and symlink to agent location.
+    // Reuse the copy when another agent in this batch already wrote it.
+    if (!(options.reuseCanonicalCopy && existsSync(canonicalDir))) {
+      await cleanAndCreateDirectory(canonicalDir);
+      await writeSkillFiles(canonicalDir);
+    }
 
-    // For universal agents with global install, skip creating agent-specific symlink
-    if (isGlobal && isUniversalAgent(agentType)) {
+    // Universal agents share the canonical directory, so there is no second
+    // location to link. This also covers global installs and Eve subagents.
+    if (resolve(agentDir) === resolve(canonicalDir)) {
       return {
         success: true,
         path: canonicalDir,
@@ -1057,10 +1075,12 @@ export async function installBlobSkillForAgent(
     }
 
     // Symlink mode
-    await cleanAndCreateDirectory(canonicalDir);
-    await writeSkillFiles(canonicalDir);
+    if (!(options.reuseCanonicalCopy && existsSync(canonicalDir))) {
+      await cleanAndCreateDirectory(canonicalDir);
+      await writeSkillFiles(canonicalDir);
+    }
 
-    if (isGlobal && isUniversalAgent(agentType)) {
+    if (resolve(agentDir) === resolve(canonicalDir)) {
       return {
         success: true,
         path: canonicalDir,
