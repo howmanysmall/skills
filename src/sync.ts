@@ -24,6 +24,7 @@ import {
 import { searchMultiselect } from './prompts/search-multiselect.ts';
 import {
   addSkillToLocalLock,
+  addSkillsToLocalLock,
   computeSkillFolderHash,
   readLocalLock,
   writeLocalLock,
@@ -35,7 +36,7 @@ import { track } from './telemetry.ts';
 import { detectAgent, getAgentType } from './detect-agent.ts';
 import { getLastSelectedAgents, saveSelectedAgents } from './skill-lock.ts';
 import { parseSkillsField, type RemoteSkillsRequest } from './skills-field.ts';
-import { getProjectLockSource, installFromSource } from './add.ts';
+import { getProjectLockSource, installFromSource, projectLockEntries } from './add.ts';
 
 const isCancelled = (value: unknown): value is symbol => typeof value === 'symbol';
 
@@ -927,7 +928,6 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
     const result = await installFromSource(request.parsed, {
       skills: request.skills,
       agents: targetAgents,
-      via: request.via,
       select: async (skills) => {
         const selected: Skill[] = [];
         for (const skill of skills) {
@@ -952,8 +952,9 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
       continue;
     }
     if (result.installed.length > 0) {
+      await addSkillsToLocalLock(projectLockEntries(request.parsed, result.installed, request.via));
       p.log.success(
-        `Installed ${result.installed.map((name) => pc.cyan(name)).join(', ')} from ${label}`
+        `Installed ${result.installed.map(({ name }) => pc.cyan(name)).join(', ')} from ${label}`
       );
     }
     for (const failure of result.failed) p.log.error(failure);

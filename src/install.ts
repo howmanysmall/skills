@@ -1,7 +1,17 @@
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
-import { readLocalLock, addSkillsToLocalLock, type LocalSkillLockEntry } from './local-lock.ts';
-import { installFromSourceDetails, restoreWellKnownSkills, silentSpinner } from './add.ts';
+import {
+  readLocalLock,
+  addSkillsToLocalLock,
+  computeSkillFolderHash,
+  type LocalSkillLockEntry,
+} from './local-lock.ts';
+import { installFromSource, installWellKnownToAgents, silentSpinner } from './add.ts';
+import {
+  wellKnownProvider,
+  computeWellKnownSkillDigest,
+  type WellKnownSkill,
+} from './providers/index.ts';
 import { runSync, parseSyncOptions } from './sync.ts';
 import { getUniversalAgents } from './agents.ts';
 import { buildLocalCloneSource, formatSourceInput } from './update-source.ts';
@@ -97,7 +107,7 @@ async function restoreSourceGroup(
     : undefined;
 
   let resolution: SkillResolution = { missing: [], ambiguous: [], relocated: [] };
-  const details = await installFromSourceDetails(parseSource(group.installSource), {
+  const details = await installFromSource(parseSource(group.installSource), {
     skills: [],
     agents,
     includeInternal: true,
@@ -117,34 +127,63 @@ async function restoreSourceGroup(
     lockUpdates[name] = {
       ...entry,
       ...(repoPath && { skillPath: repoPath }),
-      ...(hash && { computedHash: hash }),
+      computedHash: hash,
     };
   }
 
   return { ...resolution, lockUpdates, failed: details.failed, error: details.error };
 }
 
-/** Restore one well-known source without letting a missing skill exit the CLI. */
-async function restoreWellKnownGroup(
+/**
+ * Restore one well-known source from its published index. A skill that left
+ * the index is reported as missing instead of exiting the CLI.
+ */
+export async function restoreWellKnownGroup(
   url: string,
   entries: Record<string, LocalSkillLockEntry>,
-  agents: AgentType[]
+  agents: AgentType[],
+  cwd = process.cwd()
 ): Promise<RestoreOutcome> {
-  const details = await restoreWellKnownSkills(url, Object.keys(entries), agents);
-  const lockUpdates: Record<string, LocalSkillLockEntry> = {};
-  for (const { name, hash, digest } of details.installed) {
-    const entry = entries[name];
-    if (!entry) continue;
-    lockUpdates[name] = { ...entry, ...(hash && { computedHash: hash }), wellKnownDigest: digest };
-  }
-  return {
-    lockUpdates,
-    missing: details.missing,
-    ambiguous: details.ambiguous,
-    failed: details.failed,
+  const outcome: RestoreOutcome = {
+    lockUpdates: {},
+    missing: [],
+    ambiguous: [],
+    failed: [],
     relocated: [],
-    error: details.error,
   };
+  let available: WellKnownSkill[];
+  try {
+    available = await wellKnownProvider.fetchAllSkills(url, { includeInternal: true });
+  } catch (error) {
+    return { ...outcome, error: error instanceof Error ? error.message : String(error) };
+  }
+
+  for (const [name, entry] of Object.entries(entries)) {
+    const candidates = available.filter(
+      (skill) => skill.installName === name || skill.name === name
+    );
+    if (candidates.length === 0) {
+      outcome.missing.push(name);
+      continue;
+    }
+    if (candidates.length > 1) {
+      outcome.ambiguous.push(name);
+      continue;
+    }
+    const skill = candidates[0]!;
+    const results = await installWellKnownToAgents(skill, agents, { cwd, mode: 'symlink' });
+    for (const r of results) {
+      if (!r.success) outcome.failed.push(`${r.skill} → ${r.agent}: ${r.error}`);
+    }
+    const canonicalDir = results.find((r) => r.success)?.canonicalPath;
+    if (!canonicalDir) continue;
+    outcome.lockUpdates[name] = {
+      ...entry,
+      computedHash: await computeSkillFolderHash(canonicalDir),
+      wellKnownDigest: computeWellKnownSkillDigest(skill),
+    };
+  }
+  return outcome;
 }
 
 function reportOutcome(label: string, outcome: RestoreOutcome): void {

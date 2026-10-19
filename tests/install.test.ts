@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runInstallFromLock } from '../src/install.ts';
 import * as localLock from '../src/local-lock.ts';
 import * as add from '../src/add.ts';
+import { wellKnownProvider, type WellKnownSkill } from '../src/providers/index.ts';
 
 vi.mock('../src/local-lock.ts');
 vi.mock('../src/add.ts');
@@ -16,14 +17,8 @@ vi.mock('../src/agents.ts', () => ({
 describe('runInstallFromLock', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(add.installFromSourceDetails).mockResolvedValue({
+    vi.mocked(add.installFromSource).mockResolvedValue({
       installed: [{ name: 'skill-a', repoPath: 'skills/skill-a/SKILL.md', hash: 'hash' }],
-      failed: [],
-    });
-    vi.mocked(add.restoreWellKnownSkills).mockResolvedValue({
-      installed: [],
-      missing: [],
-      ambiguous: [],
       failed: [],
     });
   });
@@ -44,7 +39,7 @@ describe('runInstallFromLock', () => {
 
     await runInstallFromLock([]);
 
-    expect(add.installFromSourceDetails).toHaveBeenCalledWith(
+    expect(add.installFromSource).toHaveBeenCalledWith(
       expect.objectContaining({ url: 'https://gitlab.example.com/acme/skills.git' }),
       expect.objectContaining({ agents: ['cursor'], includeInternal: true })
     );
@@ -65,7 +60,7 @@ describe('runInstallFromLock', () => {
 
     await runInstallFromLock([]);
 
-    expect(add.installFromSourceDetails).not.toHaveBeenCalled();
+    expect(add.installFromSource).not.toHaveBeenCalled();
   });
 
   it('restores well-known sources without exiting on a missing skill', async () => {
@@ -81,21 +76,29 @@ describe('runInstallFromLock', () => {
         },
       },
     });
-    vi.mocked(add.restoreWellKnownSkills).mockResolvedValue({
-      installed: [{ name: 'skill-a', hash: 'new-hash', digest: 'sha256:new' }],
-      missing: [],
-      ambiguous: [],
-      failed: [],
-    });
+    const fetchAllSkills = vi.spyOn(wellKnownProvider, 'fetchAllSkills').mockResolvedValue([
+      {
+        name: 'skill-a',
+        installName: 'skill-a',
+        indexEntry: { digest: 'sha256:new' },
+      } as unknown as WellKnownSkill,
+    ]);
+    vi.mocked(add.installWellKnownToAgents).mockResolvedValue([
+      {
+        skill: 'skill-a',
+        agent: 'Cursor',
+        success: true,
+        path: '/project/.agents/skills/skill-a',
+        canonicalPath: '/project/.agents/skills/skill-a',
+        mode: 'symlink',
+      },
+    ]);
+    vi.mocked(localLock.computeSkillFolderHash).mockResolvedValue('new-hash');
 
     await runInstallFromLock([]);
 
-    expect(add.installFromSourceDetails).not.toHaveBeenCalled();
-    expect(add.restoreWellKnownSkills).toHaveBeenCalledWith(
-      'https://example.com',
-      ['skill-a'],
-      ['cursor']
-    );
+    expect(add.installFromSource).not.toHaveBeenCalled();
+    expect(fetchAllSkills).toHaveBeenCalledWith('https://example.com', { includeInternal: true });
     expect(localLock.addSkillsToLocalLock).toHaveBeenCalledWith(
       {
         'skill-a': expect.objectContaining({
@@ -121,7 +124,7 @@ describe('runInstallFromLock', () => {
         beta: { ...entry, skillPath: 'skills/beta/SKILL.md' },
       },
     });
-    vi.mocked(add.installFromSourceDetails).mockResolvedValue({
+    vi.mocked(add.installFromSource).mockResolvedValue({
       installed: [
         { name: 'alpha', repoPath: 'skills/alpha/SKILL.md', hash: 'hash' },
         { name: 'beta', repoPath: 'skills/beta/SKILL.md', hash: 'hash' },
@@ -131,6 +134,6 @@ describe('runInstallFromLock', () => {
 
     await runInstallFromLock([]);
 
-    expect(add.installFromSourceDetails).toHaveBeenCalledTimes(1);
+    expect(add.installFromSource).toHaveBeenCalledTimes(1);
   });
 });

@@ -3,7 +3,8 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { restoreWellKnownSkills } from '../src/add.ts';
+import { restoreWellKnownGroup } from '../src/install.ts';
+import type { LocalSkillLockEntry } from '../src/local-lock.ts';
 import { getUniversalAgents } from '../src/agents.ts';
 import { wellKnownProvider, type WellKnownSkill } from '../src/providers/index.ts';
 
@@ -29,7 +30,16 @@ function fixture(installName: string): WellKnownSkill {
   };
 }
 
-describe('restoreWellKnownSkills', () => {
+function locked(...names: string[]): Record<string, LocalSkillLockEntry> {
+  return Object.fromEntries(
+    names.map((name) => [
+      name,
+      { source: 'example.com', sourceType: 'well-known', computedHash: 'old' },
+    ])
+  );
+}
+
+describe('restoreWellKnownGroup', () => {
   let cwd: string;
 
   beforeEach(async () => {
@@ -47,16 +57,19 @@ describe('restoreWellKnownSkills', () => {
       fixture('beta'),
     ]);
 
-    const result = await restoreWellKnownSkills(
+    const result = await restoreWellKnownGroup(
       'https://example.com',
-      ['alpha', 'removed-skill'],
+      locked('alpha', 'removed-skill'),
       getUniversalAgents().slice(0, 2),
-      { cwd }
+      cwd
     );
 
-    expect(result.installed).toEqual([
-      { name: 'alpha', hash: expect.stringMatching(/^[a-f0-9]{64}$/), digest: 'sha256:alpha' },
-    ]);
+    expect(result.lockUpdates).toEqual({
+      alpha: expect.objectContaining({
+        computedHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        wellKnownDigest: 'sha256:alpha',
+      }),
+    });
     expect(result.missing).toEqual(['removed-skill']);
     expect(result.error).toBeUndefined();
     expect(existsSync(join(cwd, '.agents', 'skills', 'alpha', 'SKILL.md'))).toBe(true);
@@ -69,14 +82,14 @@ describe('restoreWellKnownSkills', () => {
   it('reports a source that has no reachable index as an error', async () => {
     vi.spyOn(wellKnownProvider, 'fetchAllSkills').mockResolvedValue([]);
 
-    const result = await restoreWellKnownSkills(
+    const result = await restoreWellKnownGroup(
       'https://example.com',
-      ['alpha'],
+      locked('alpha'),
       getUniversalAgents().slice(0, 1),
-      { cwd }
+      cwd
     );
 
-    expect(result.installed).toEqual([]);
+    expect(result.lockUpdates).toEqual({});
     expect(result.missing).toEqual(['alpha']);
   });
 });
