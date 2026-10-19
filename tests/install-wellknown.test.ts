@@ -54,12 +54,12 @@ describe('restoreWellKnownSkills', () => {
       { cwd }
     );
 
-    expect(result.installed).toEqual(['alpha']);
+    expect(result.installed).toEqual([
+      { name: 'alpha', hash: expect.stringMatching(/^[a-f0-9]{64}$/), digest: 'sha256:alpha' },
+    ]);
     expect(result.missing).toEqual(['removed-skill']);
     expect(result.error).toBeUndefined();
     expect(existsSync(join(cwd, '.agents', 'skills', 'alpha', 'SKILL.md'))).toBe(true);
-    expect(result.hashes.alpha).toMatch(/^[a-f0-9]{64}$/);
-    expect(result.digests.alpha).toBe('sha256:alpha');
 
     const installed = await readFile(join(cwd, '.agents', 'skills', 'alpha', 'SKILL.md'), 'utf-8');
     expect(installed).toContain('# alpha');

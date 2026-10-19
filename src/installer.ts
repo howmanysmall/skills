@@ -44,12 +44,8 @@ interface InstallOptions {
   eveSubagent?: string;
   /** Create a missing agent-specific project root because the user selected this agent. */
   createMissingAgentRoot?: boolean;
-  /**
-   * Trust a canonical copy written earlier in the same install batch instead of
-   * deleting and recopying it for every additional agent targeting the same
-   * skill. Leave unset unless the caller has already installed this skill once.
-   */
-  reuseCanonicalCopy?: boolean;
+  /** Canonical directories already written in this batch; reused instead of recopied. */
+  reuseCanonicalDirs?: ReadonlySet<string>;
 }
 
 interface InstallResult {
@@ -408,7 +404,7 @@ export async function installSkillForAgent(
       } else {
         // Symlink mode: copy to canonical location and symlink to agent location.
         // Reuse the copy when another agent in this batch already wrote it.
-        if (!(options.reuseCanonicalCopy && existsSync(canonicalDir))) {
+        if (!options.reuseCanonicalDirs?.has(canonicalDir)) {
           await cleanAndCreateDirectory(canonicalDir);
           await copyDirectory(skill.path, canonicalDir, agentType);
         }
@@ -825,7 +821,7 @@ export async function installWellKnownSkillForAgent(
     cwd?: string;
     mode?: InstallMode;
     eveSubagent?: string;
-    reuseCanonicalCopy?: boolean;
+    reuseCanonicalDirs?: ReadonlySet<string>;
   } = {}
 ): Promise<InstallResult> {
   const agent = agents[agentType];
@@ -920,7 +916,7 @@ export async function installWellKnownSkillForAgent(
 
     // Symlink mode: write to canonical location and symlink to agent location.
     // Reuse the copy when another agent in this batch already wrote it.
-    if (!(options.reuseCanonicalCopy && existsSync(canonicalDir))) {
+    if (!options.reuseCanonicalDirs?.has(canonicalDir)) {
       await cleanAndCreateDirectory(canonicalDir);
       await writeSkillFiles(canonicalDir);
     }
@@ -1075,7 +1071,7 @@ export async function installBlobSkillForAgent(
     }
 
     // Symlink mode
-    if (!(options.reuseCanonicalCopy && existsSync(canonicalDir))) {
+    if (!options.reuseCanonicalDirs?.has(canonicalDir)) {
       await cleanAndCreateDirectory(canonicalDir);
       await writeSkillFiles(canonicalDir);
     }

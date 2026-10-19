@@ -17,18 +17,14 @@ describe('runInstallFromLock', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(add.installFromSourceDetails).mockResolvedValue({
-      installed: ['skill-a'],
+      installed: [{ name: 'skill-a', repoPath: 'skills/skill-a/SKILL.md', hash: 'hash' }],
       failed: [],
-      repoPaths: { 'skill-a': 'skills/skill-a/SKILL.md' },
-      hashes: { 'skill-a': 'hash' },
     });
     vi.mocked(add.restoreWellKnownSkills).mockResolvedValue({
       installed: [],
       missing: [],
       ambiguous: [],
       failed: [],
-      digests: {},
-      hashes: {},
     });
   });
 
@@ -50,11 +46,7 @@ describe('runInstallFromLock', () => {
 
     expect(add.installFromSourceDetails).toHaveBeenCalledWith(
       expect.objectContaining({ url: 'https://gitlab.example.com/acme/skills.git' }),
-      expect.objectContaining({
-        agents: ['cursor'],
-        includeInternal: true,
-        fullDepth: true,
-      })
+      expect.objectContaining({ agents: ['cursor'], includeInternal: true })
     );
   });
 
@@ -90,12 +82,10 @@ describe('runInstallFromLock', () => {
       },
     });
     vi.mocked(add.restoreWellKnownSkills).mockResolvedValue({
-      installed: ['skill-a'],
+      installed: [{ name: 'skill-a', hash: 'new-hash', digest: 'sha256:new' }],
       missing: [],
       ambiguous: [],
       failed: [],
-      digests: { 'skill-a': 'sha256:new' },
-      hashes: { 'skill-a': 'new-hash' },
     });
 
     await runInstallFromLock([]);
@@ -132,10 +122,11 @@ describe('runInstallFromLock', () => {
       },
     });
     vi.mocked(add.installFromSourceDetails).mockResolvedValue({
-      installed: ['alpha', 'beta'],
+      installed: [
+        { name: 'alpha', repoPath: 'skills/alpha/SKILL.md', hash: 'hash' },
+        { name: 'beta', repoPath: 'skills/beta/SKILL.md', hash: 'hash' },
+      ],
       failed: [],
-      repoPaths: { alpha: 'skills/alpha/SKILL.md', beta: 'skills/beta/SKILL.md' },
-      hashes: { alpha: 'hash', beta: 'hash' },
     });
 
     await runInstallFromLock([]);

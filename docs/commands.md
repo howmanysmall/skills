@@ -339,7 +339,7 @@ npx skills experimental_install
 
 Restore supported sources recorded in `skills-lock.json` into `.agents/skills/`.
 Each repository is fetched and discovered once, then its locked skills are
-installed from that single checkout. Independent repositories are restored
+installed from that single checkout. Independent sources are restored
 concurrently (four at a time by default; set `SKILLS_INSTALL_CONCURRENCY` to
 change it).
 
