@@ -27,7 +27,7 @@ Ensure you have write access to the target directory.
 | `DO_NOT_TRACK`               | Alternative way to disable telemetry                                       |
 | `GITHUB_TOKEN`               | Optional explicit token for authenticated GitHub API requests              |
 | `GH_TOKEN`                   | Fallback explicit token for authenticated GitHub API requests              |
-| `SKILLS_INSTALL_CONCURRENCY` | How many sources `experimental_install` restores at once (default `4`)      |
+| `SKILLS_INSTALL_CONCURRENCY` | How many sources `experimental_install` restores at once (default `4`)     |
 
 ```bash
 # Install internal skills
