@@ -171,6 +171,8 @@ Check installed skills for available updates without reinstalling them:
 npx skills check
 ```
 
+It exits with code 1 when any skill has an update, so it can gate CI.
+
 ## `skills update`
 
 ```bash
@@ -252,16 +254,22 @@ npx skills rm my-skill
 | `-y, --yes`    | Skip confirmation prompts                        |
 | `--all`        | Shorthand for `--skill '*' --agent '*' -y`       |
 
-## `skills sync`
+## Experimental commands
 
-Sync skills from npm packages and `package.json` declarations. `experimental_sync`
-remains supported as an alias.
+These commands are still experimental. Their names, options, and behavior may change.
+
+<a id="skills-sync"></a>
+
+### `skills experimental_sync`
+
+Sync skills from npm packages and `package.json` declarations. `sync` remains
+supported as a compatibility alias for users of skills@1.7.3.
 
 Install a package that ships skills, then sync them into your project:
 
 ```bash
 npm install -D skills agent-browser
-npx skills sync -y
+npx skills experimental_sync -y
 ```
 
 Sync reads installed dependencies declared in your project's `package.json`, including
@@ -275,7 +283,7 @@ The `.agents/skills/` directory is the shared location. Selecting Claude Code al
 creates links under `.claude/skills/` pointing to the shared skills:
 
 ```bash
-npx skills sync -a claude-code -y
+npx skills experimental_sync -a claude-code -y
 ```
 
 Outside an agent, sync detects installed agents. When run inside a coding agent,
@@ -289,7 +297,7 @@ To run sync after dependency installation, add a `prepare` script:
 ```json
 {
   "scripts": {
-    "prepare": "skills sync -y"
+    "prepare": "skills experimental_sync -y"
   }
 }
 ```
@@ -311,6 +319,15 @@ and [RFC](https://github.com/vercel-labs/skills/issues/2323) for the full propos
 Sync tracks its skills in `skills-lock.json`, removes skills that are no longer
 provided, and preserves skills installed separately with `skills add`.
 
+When two skills share a name, sync applies these rules in order:
+
+1. A skill installed with `skills add` is never shadowed, and a directory or link
+   that sync did not create is never replaced.
+2. A skill shipped by a direct dependency beats one from a transitive package, and a
+   shipped skill beats one requested from a Git source.
+3. Two packages at the same level shipping the same skill name install neither.
+   Pick one with `--exclude <package>#<skill>`.
+
 | Option                    | Description                                                   |
 | ------------------------- | ------------------------------------------------------------- |
 | `-a, --agent <agents...>` | Select agent directories                                      |
@@ -322,14 +339,19 @@ provided, and preserves skills installed separately with `skills add`.
 | `--include <patterns...>` | Include skills by package or `package#skill` pattern          |
 | `--exclude <patterns...>` | Exclude skills by package or `package#skill` pattern          |
 | `-r, --recursive`         | Also read dependencies of workspace packages                  |
+| `--frozen-lockfile`       | Fail instead of changing `skills-lock.json` (default in CI)   |
+| `--no-frozen-lockfile`    | Allow `skills-lock.json` to change in CI                      |
 
 The include/exclude filters apply to both packaged and remote skills. For remote
 skills, the package pattern matches the package declaring the entry (`.` for the
 project's own field). Eve always receives copies because it rewrites skill frontmatter.
 
-## Experimental commands
-
-These commands are still experimental. Their names, options, and behavior may change.
+With `--frozen-lockfile`, sync installs only what `skills-lock.json` already records.
+It exits with code 1 and changes nothing when a packaged skill is missing from the
+lock, its content or package version differs, a locked skill is no longer provided
+by any dependency, or a remote `skills` entry resolves to different content. This is
+the default when a CI environment variable such as `CI` or `GITHUB_ACTIONS` is set;
+pass `--no-frozen-lockfile` to update the lock from CI.
 
 ### Restore skills from the project lock file
 
@@ -339,9 +361,9 @@ npx skills experimental_install
 
 Restore supported sources recorded in `skills-lock.json` into `.agents/skills/`.
 Each repository is fetched and discovered once, then its locked skills are
-installed from that single checkout. Independent sources are restored
-concurrently (four at a time by default; set `SKILLS_INSTALL_CONCURRENCY` to
-change it).
+installed from that single checkout. Sources are downloaded in parallel, and
+independent sources are restored concurrently (four at a time by default; set
+`SKILLS_INSTALL_CONCURRENCY` to change it).
 
 A skill that disappeared or moved upstream does not stop the restore:
 
@@ -351,6 +373,20 @@ A skill that disappeared or moved upstream does not stop the restore:
   still install, and the command exits non-zero so CI notices. Remove it with
   `skills remove <name>` when you no longer need it.
 
-Entries from npm packages are synced from the dependencies already on disk, so
+Skills already in `.agents/skills/` are left as they are; pass `--force` to reinstall
+them. Entries from npm packages are synced from the dependencies already on disk, so
 install your npm dependencies before restoring. This command does not install
 npm packages or create agent-specific links for restored skills.
+
+| Option                 | Description                                                 |
+| ---------------------- | ----------------------------------------------------------- |
+| `--dry-run`            | Show what would be restored without installing anything     |
+| `--frozen-lockfile`    | Fail instead of changing `skills-lock.json` (default in CI) |
+| `--no-frozen-lockfile` | Allow `skills-lock.json` to change in CI                    |
+| `--force`              | Reinstall skills that are already in `.agents/skills/`      |
+
+With `--frozen-lockfile`, every restored skill must match the content hash recorded
+in `skills-lock.json`. A source whose skills differ is skipped entirely, the lock is
+left untouched, and the command exits with code 1. A missing or empty lock is also
+an error. This is the default in CI; pass `--no-frozen-lockfile` to refresh the lock
+from CI instead.

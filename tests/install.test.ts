@@ -13,12 +13,26 @@ vi.mock('../src/sync.ts', () => ({
 vi.mock('../src/agents.ts', () => ({
   getUniversalAgents: vi.fn().mockReturnValue(['cursor']),
 }));
+// The suite itself runs in CI, where --frozen-lockfile would otherwise default on
+vi.mock('../src/ci.ts', () => ({ isCI: () => false }));
+
+function installedSkill(name: string): add.InstalledSkill {
+  return {
+    skill: { name, description: name, path: `/tmp/${name}` },
+    repoPath: `skills/${name}/SKILL.md`,
+    hash: 'hash',
+  };
+}
 
 describe('runInstallFromLock', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(add.fetchSources).mockImplementation(async (requests) =>
+      requests.map(({ parsed }) => ({ parsed, resolved: null, error: 'not fetched' }))
+    );
     vi.mocked(add.installFromSource).mockResolvedValue({
-      installed: [{ name: 'skill-a', repoPath: 'skills/skill-a/SKILL.md', hash: 'hash' }],
+      installed: ['skill-a'],
+      installedSkills: [installedSkill('skill-a')],
       failed: [],
     });
   });
@@ -40,8 +54,10 @@ describe('runInstallFromLock', () => {
     await runInstallFromLock([]);
 
     expect(add.installFromSource).toHaveBeenCalledWith(
-      expect.objectContaining({ url: 'https://gitlab.example.com/acme/skills.git' }),
-      expect.objectContaining({ agents: ['cursor'], includeInternal: true })
+      expect.objectContaining({
+        parsed: expect.objectContaining({ url: 'https://gitlab.example.com/acme/skills.git' }),
+      }),
+      expect.objectContaining({ agents: ['cursor'] })
     );
   });
 
@@ -125,10 +141,8 @@ describe('runInstallFromLock', () => {
       },
     });
     vi.mocked(add.installFromSource).mockResolvedValue({
-      installed: [
-        { name: 'alpha', repoPath: 'skills/alpha/SKILL.md', hash: 'hash' },
-        { name: 'beta', repoPath: 'skills/beta/SKILL.md', hash: 'hash' },
-      ],
+      installed: ['alpha', 'beta'],
+      installedSkills: [installedSkill('alpha'), installedSkill('beta')],
       failed: [],
     });
 

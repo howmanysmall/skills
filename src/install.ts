@@ -1,12 +1,22 @@
+import { existsSync } from 'fs';
+import { join } from 'path';
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import {
   readLocalLock,
   addSkillsToLocalLock,
   computeSkillFolderHash,
+  frozenLockfileError,
+  lockChangeReason,
   type LocalSkillLockEntry,
+  type LocalSkillLockFile,
 } from './local-lock.ts';
-import { installFromSource, installWellKnownToAgents, silentSpinner } from './add.ts';
+import {
+  fetchSources,
+  installFromSource,
+  installWellKnownToAgents,
+  type FetchedSource,
+} from './add.ts';
 import {
   wellKnownProvider,
   computeWellKnownSkillDigest,
@@ -17,6 +27,8 @@ import { getUniversalAgents } from './agents.ts';
 import { buildLocalCloneSource, formatSourceInput } from './update-source.ts';
 import { getPositiveIntegerEnv } from './download-source.ts';
 import { parseSource } from './source-parser.ts';
+import { isCI } from './ci.ts';
+import { getCanonicalPath } from './installer.ts';
 import { filterSkills } from './skills.ts';
 import { normalizeSkillPath, resolveSkillLocations } from './skill-relocation.ts';
 import type { AgentType, Skill } from './types.ts';
@@ -93,26 +105,29 @@ function selectLockedSkills(
   return { selected, resolution: { missing, ambiguous: locations.ambiguousSkills, relocated } };
 }
 
-/** Restore one repository's locked skills, cloning and discovering it once. */
+/**
+ * Locked SKILL.md paths to read instead of walking the repository. That avoids
+ * parsing (and warning about) unrelated skills that happen to be broken.
+ * Only usable when every entry knows its path.
+ */
+function lockedSkillPaths(group: LockedSourceGroup): string[] | undefined {
+  const lockedPaths = Object.values(group.entries).map((entry) => entry.skillPath);
+  return lockedPaths.every((path): path is string => Boolean(path)) ? lockedPaths : undefined;
+}
+
+/** Restore one already-fetched repository's locked skills from its single checkout. */
 async function restoreSourceGroup(
   group: LockedSourceGroup,
-  agents: AgentType[]
+  fetched: FetchedSource,
+  agents: AgentType[],
+  frozenLock?: LocalSkillLockFile
 ): Promise<RestoreOutcome> {
-  // When every entry knows its path, read just those SKILL.md files instead of
-  // walking the repository. That avoids parsing (and warning about) unrelated
-  // skills that happen to be broken.
-  const lockedPaths = Object.values(group.entries).map((entry) => entry.skillPath);
-  const skillPaths = lockedPaths.every((path): path is string => Boolean(path))
-    ? lockedPaths
-    : undefined;
-
   let resolution: SkillResolution = { missing: [], ambiguous: [], relocated: [] };
-  const details = await installFromSource(parseSource(group.installSource), {
+  const details = await installFromSource(fetched, {
     skills: [],
     agents,
-    includeInternal: true,
-    skillPaths,
-    spinner: silentSpinner,
+    recordLock: false,
+    ...(frozenLock && { frozenLock }),
     select: async (skills, repoPaths) => {
       const selection = selectLockedSkills(skills, repoPaths, group.entries);
       resolution = selection.resolution;
@@ -121,10 +136,10 @@ async function restoreSourceGroup(
   });
 
   const lockUpdates: Record<string, LocalSkillLockEntry> = {};
-  for (const { name, repoPath, hash } of details.installed) {
-    const entry = group.entries[name];
+  for (const { skill, repoPath, hash } of details.installedSkills) {
+    const entry = group.entries[skill.name];
     if (!entry) continue;
-    lockUpdates[name] = {
+    lockUpdates[skill.name] = {
       ...entry,
       ...(repoPath && { skillPath: repoPath }),
       computedHash: hash,
@@ -142,7 +157,8 @@ export async function restoreWellKnownGroup(
   url: string,
   entries: Record<string, LocalSkillLockEntry>,
   agents: AgentType[],
-  cwd = process.cwd()
+  cwd = process.cwd(),
+  frozenLock?: LocalSkillLockFile
 ): Promise<RestoreOutcome> {
   const outcome: RestoreOutcome = {
     lockUpdates: {},
@@ -158,6 +174,7 @@ export async function restoreWellKnownGroup(
     return { ...outcome, error: error instanceof Error ? error.message : String(error) };
   }
 
+  const changes: string[] = [];
   for (const [name, entry] of Object.entries(entries)) {
     const candidates = available.filter(
       (skill) => skill.installName === name || skill.name === name
@@ -177,12 +194,20 @@ export async function restoreWellKnownGroup(
     }
     const canonicalDir = results.find((r) => r.success)?.canonicalPath;
     if (!canonicalDir) continue;
+    const computedHash = await computeSkillFolderHash(canonicalDir);
+    if (frozenLock) {
+      // A well-known skill can only be hashed once it is installed.
+      const reason = lockChangeReason(frozenLock, name, { computedHash });
+      if (reason) changes.push(reason);
+      continue;
+    }
     outcome.lockUpdates[name] = {
       ...entry,
-      computedHash: await computeSkillFolderHash(canonicalDir),
+      computedHash,
       wellKnownDigest: computeWellKnownSkillDigest(skill),
     };
   }
+  if (changes.length > 0) outcome.error = frozenLockfileError(changes);
   return outcome;
 }
 
@@ -236,7 +261,8 @@ async function forEachConcurrent<T>(
 }
 
 /**
- * Install all skills from the local skills-lock.json.
+ * Install the skills from the local skills-lock.json that are not already in
+ * .agents/skills/ (all of them with --force).
  * Groups skills by source and installs each group; a failing source does not
  * stop the others.
  *
@@ -247,10 +273,20 @@ async function forEachConcurrent<T>(
  */
 export async function runInstallFromLock(args: string[]): Promise<void> {
   const cwd = process.cwd();
+  const { options: syncOptions } = parseSyncOptions(args);
+  const frozen = syncOptions.frozenLockfile ?? isCI();
+  const force = args.includes('--force');
   const lock = await readLocalLock(cwd);
   const skillEntries = Object.entries(lock.skills);
 
   if (skillEntries.length === 0) {
+    if (frozen) {
+      p.log.error(
+        'Cannot install with --frozen-lockfile because skills-lock.json is absent or has no skills'
+      );
+      process.exitCode = 1;
+      return;
+    }
     p.log.warn('No project skills found in skills-lock.json');
     p.log.info(
       `Add project-level skills with ${pc.cyan('npx skills add <package>')} (without ${pc.cyan('-g')})`
@@ -263,12 +299,18 @@ export async function runInstallFromLock(args: string[]): Promise<void> {
 
   // Separate node_modules and well-known sources from Git-backed sources.
   const nodeModuleSkills: string[] = [];
+  const alreadyInstalled: string[] = [];
   const wellKnownGroups = new Map<string, Record<string, LocalSkillLockEntry>>();
   const sourceGroups = new Map<string, LockedSourceGroup>();
 
   for (const [skillName, entry] of skillEntries) {
     if (entry.sourceType === 'node_modules') {
       nodeModuleSkills.push(skillName);
+      continue;
+    }
+
+    if (!force && existsSync(join(getCanonicalPath(skillName, { cwd }), 'SKILL.md'))) {
+      alreadyInstalled.push(skillName);
       continue;
     }
 
@@ -303,58 +345,89 @@ export async function runInstallFromLock(args: string[]): Promise<void> {
     }
   }
 
-  const remoteCount = skillEntries.length - nodeModuleSkills.length;
+  if (alreadyInstalled.length > 0) {
+    p.log.info(
+      `${pc.cyan(String(alreadyInstalled.length))} skill${alreadyInstalled.length !== 1 ? 's' : ''} already installed ${pc.dim('(use --force to reinstall)')}`
+    );
+  }
+
+  const remoteCount = skillEntries.length - nodeModuleSkills.length - alreadyInstalled.length;
   if (remoteCount > 0) {
     p.log.info(
-      `Restoring ${pc.cyan(String(remoteCount))} skill${remoteCount !== 1 ? 's' : ''} from skills-lock.json into ${pc.dim('.agents/skills/')}`
+      `${syncOptions.dryRun ? 'Would restore' : 'Restoring'} ${pc.cyan(String(remoteCount))} skill${remoteCount !== 1 ? 's' : ''} from skills-lock.json into ${pc.dim('.agents/skills/')}`
     );
   }
 
-  // Sources are independent, so repositories and well-known indexes restore concurrently.
-  const tasks = [
-    ...[...sourceGroups.values()].map((group) => ({
-      label: group.label,
-      count: Object.keys(group.entries).length,
-      run: () => restoreSourceGroup(group, universalAgentNames),
-    })),
-    ...[...wellKnownGroups].map(([url, entries]) => ({
-      label: url,
-      count: Object.keys(entries).length,
-      run: () => restoreWellKnownGroup(url, entries, universalAgentNames),
-    })),
-  ];
-  for (const task of tasks) {
-    p.log.info(
-      `Restoring ${task.count} skill${task.count !== 1 ? 's' : ''} from ${pc.cyan(task.label)}`
-    );
-  }
-
-  const pendingLockUpdates: Record<string, LocalSkillLockEntry> = {};
-  const concurrency = getPositiveIntegerEnv(
-    'SKILLS_INSTALL_CONCURRENCY',
-    DEFAULT_INSTALL_CONCURRENCY
-  );
-  await forEachConcurrent(tasks, concurrency, async (task) => {
-    let outcome: RestoreOutcome;
-    try {
-      outcome = await task.run();
-    } catch (error) {
-      outcome = {
-        lockUpdates: {},
-        missing: [],
-        ambiguous: [],
-        failed: [],
-        relocated: [],
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
+  const groups = [...sourceGroups.values()];
+  const wellKnownList = [...wellKnownGroups];
+  if (syncOptions.dryRun) {
+    // Nothing is fetched or installed; node_modules entries below are reported by sync's own dry run.
+    for (const { label, entries } of [
+      ...groups,
+      ...wellKnownList.map(([url, entries]) => ({ label: url, entries })),
+    ]) {
+      p.log.message(
+        `${Object.keys(entries)
+          .map((name) => pc.cyan(name))
+          .join(', ')} ${pc.dim(`from ${label}`)}`
+      );
     }
-    Object.assign(pendingLockUpdates, outcome.lockUpdates);
-    reportOutcome(task.label, outcome);
-  });
+  } else {
+    // Download every repository at once, then restore the sources concurrently.
+    const fetched = await fetchSources(
+      groups.map((group) => ({
+        parsed: parseSource(group.installSource),
+        skills: [],
+        includeInternal: true,
+        skillPaths: lockedSkillPaths(group),
+      }))
+    );
+    const frozenLock = frozen ? lock : undefined;
+    const tasks = [
+      ...groups.map((group, index) => ({
+        label: group.label,
+        count: Object.keys(group.entries).length,
+        run: () => restoreSourceGroup(group, fetched[index]!, universalAgentNames, frozenLock),
+      })),
+      ...wellKnownList.map(([url, entries]) => ({
+        label: url,
+        count: Object.keys(entries).length,
+        run: () => restoreWellKnownGroup(url, entries, universalAgentNames, cwd, frozenLock),
+      })),
+    ];
+    for (const task of tasks) {
+      p.log.info(
+        `Restoring ${task.count} skill${task.count !== 1 ? 's' : ''} from ${pc.cyan(task.label)}`
+      );
+    }
 
-  // One lock write for the whole restore; unchanged entries leave the file untouched.
-  if (Object.keys(pendingLockUpdates).length > 0) {
-    await addSkillsToLocalLock(pendingLockUpdates, cwd);
+    const pendingLockUpdates: Record<string, LocalSkillLockEntry> = {};
+    const concurrency = getPositiveIntegerEnv(
+      'SKILLS_INSTALL_CONCURRENCY',
+      DEFAULT_INSTALL_CONCURRENCY
+    );
+    await forEachConcurrent(tasks, concurrency, async (task) => {
+      let outcome: RestoreOutcome;
+      try {
+        outcome = await task.run();
+      } catch (error) {
+        outcome = {
+          lockUpdates: {},
+          missing: [],
+          ambiguous: [],
+          failed: [],
+          relocated: [],
+          error: error instanceof Error ? error.message : 'Unknown error',
+        };
+      }
+      Object.assign(pendingLockUpdates, outcome.lockUpdates);
+      reportOutcome(task.label, outcome);
+    });
+
+    // One lock write for the whole restore; a frozen lock is never touched.
+    if (!frozen && Object.keys(pendingLockUpdates).length > 0) {
+      await addSkillsToLocalLock(pendingLockUpdates, cwd);
+    }
   }
 
   // Handle node_modules skills via sync
@@ -363,8 +436,12 @@ export async function runInstallFromLock(args: string[]): Promise<void> {
       `${pc.cyan(String(nodeModuleSkills.length))} skill${nodeModuleSkills.length !== 1 ? 's' : ''} from node_modules`
     );
     try {
-      const { options: syncOptions } = parseSyncOptions(args);
-      await runSync(args, { ...syncOptions, yes: true, agent: universalAgentNames });
+      await runSync(args, {
+        ...syncOptions,
+        frozenLockfile: frozen,
+        yes: true,
+        agent: universalAgentNames,
+      });
     } catch (error) {
       p.log.error(
         `Failed to sync node_modules skills: ${error instanceof Error ? error.message : 'Unknown error'}`

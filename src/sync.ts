@@ -24,8 +24,9 @@ import {
 import { searchMultiselect } from './prompts/search-multiselect.ts';
 import {
   addSkillToLocalLock,
-  addSkillsToLocalLock,
   computeSkillFolderHash,
+  frozenLockfileError,
+  lockChangeReason,
   readLocalLock,
   writeLocalLock,
   type LocalSkillLockEntry,
@@ -33,10 +34,11 @@ import {
 } from './local-lock.ts';
 import type { Skill, AgentType } from './types.ts';
 import { track } from './telemetry.ts';
+import { isCI } from './ci.ts';
 import { detectAgent, getAgentType } from './detect-agent.ts';
 import { getLastSelectedAgents, saveSelectedAgents } from './skill-lock.ts';
 import { parseSkillsField, type RemoteSkillsRequest } from './skills-field.ts';
-import { getProjectLockSource, installFromSource, projectLockEntries } from './add.ts';
+import { fetchSources, getProjectLockSource, installFromSource } from './add.ts';
 
 const isCancelled = (value: unknown): value is symbol => typeof value === 'symbol';
 
@@ -50,6 +52,8 @@ export interface SyncOptions {
   exclude?: string[];
   remote?: boolean;
   recursive?: boolean;
+  /** Fail instead of changing skills-lock.json. Defaults to isCI(). */
+  frozenLockfile?: boolean;
 }
 
 /**
@@ -584,6 +588,14 @@ async function promptForAgentChoice(
   return selected as AgentType[] | symbol;
 }
 
+/** Under --frozen-lockfile, report `changes` and mark the run failed; true when there were any. */
+function failOnLockChanges(changes: string[]): boolean {
+  if (changes.length === 0) return false;
+  p.log.error(frozenLockfileError(changes));
+  process.exitCode = 1;
+  return true;
+}
+
 /** `entry` was installed by sync for the remote `skills` entry `request`. */
 function isFromRequest(entry: LocalSkillLockEntry, request: FieldRemoteRequest): boolean {
   return (
@@ -631,7 +643,7 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
 
   console.log();
   if (!agentResult.isAgent) {
-    p.intro(pc.bgCyan(pc.black(' skills sync ')));
+    p.intro(pc.bgCyan(pc.black(' skills experimental_sync ')));
   }
 
   if (agentResult.isAgent) {
@@ -664,6 +676,7 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   for (const warning of discovery.warnings) p.log.warn(warning);
 
   const localLock = await readLocalLock(cwd);
+  const frozen = options.frozenLockfile ?? isCI();
   if (options.cleanup !== false) {
     const keep = new Set(discoveredSkills.map((skill) => sanitizeName(skill.name)));
     // --no-remote leaves remote skills alone, both installing and removing
@@ -672,11 +685,22 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
       remote.some(
         (r) => requestsLockedSkill(r, name, entry) && remoteAllowsSkill(r, name, options)
       );
-    const stale = await pruneStaleSkills(cwd, keep, keepRemote, localLock, options.dryRun ?? false);
-    for (const name of stale) {
-      p.log.info(
-        `${options.dryRun ? 'Would remove' : 'Removed'} ${pc.cyan(name)} ${pc.dim('(no longer provided by a dependency)')}`
-      );
+    const stale = await pruneStaleSkills(
+      cwd,
+      keep,
+      keepRemote,
+      localLock,
+      frozen || (options.dryRun ?? false)
+    );
+    if (frozen) {
+      if (failOnLockChanges(stale.map((name) => `${name} is no longer provided by a dependency`)))
+        return;
+    } else {
+      for (const name of stale) {
+        p.log.info(
+          `${options.dryRun ? 'Would remove' : 'Removed'} ${pc.cyan(name)} ${pc.dim('(no longer provided by a dependency)')}`
+        );
+      }
     }
   }
 
@@ -793,6 +817,17 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
       cachedToInstall.push({ ...cached, agents: missing });
     }
   }
+  if (frozen) {
+    const changes: string[] = [];
+    for (const skill of toInstall) {
+      const reason = lockChangeReason(localLock, skill.name, {
+        computedHash: await computeSkillFolderHash(skill.path),
+        version: skill.packageVersion,
+      });
+      if (reason) changes.push(reason);
+    }
+    if (failOnLockChanges(changes)) return;
+  }
   if (toInstall.length === 0 && remoteRequests.length === 0 && cachedToInstall.length === 0) {
     console.log();
     p.outro(pc.yellow('Nothing to sync.'));
@@ -898,7 +933,7 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   const successfulSkillNames = new Set(successful.map((r) => r.skill));
 
   for (const skill of toInstall) {
-    if (successfulSkillNames.has(skill.name)) {
+    if (!frozen && successfulSkillNames.has(skill.name)) {
       try {
         const computedHash = await computeSkillFolderHash(skill.path);
         await addSkillToLocalLock(
@@ -923,11 +958,14 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   const claimed = new Set(discoveredSkills.map((skill) => sanitizeName(skill.name)));
   const lockEntryFor = (name: string) =>
     Object.entries(localLock.skills).find(([key]) => sanitizeName(key) === name)?.[1];
-  for (const request of remoteRequests) {
+  const fetched = await fetchSources(remoteRequests);
+  for (const [index, request] of remoteRequests.entries()) {
     const label = getProjectLockSource(request.parsed);
-    const result = await installFromSource(request.parsed, {
+    const result = await installFromSource(fetched[index]!, {
       skills: request.skills,
       agents: targetAgents,
+      via: request.via,
+      ...(frozen && { frozenLock: localLock }),
       select: async (skills) => {
         const selected: Skill[] = [];
         for (const skill of skills) {
@@ -952,9 +990,8 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
       continue;
     }
     if (result.installed.length > 0) {
-      await addSkillsToLocalLock(projectLockEntries(request.parsed, result.installed, request.via));
       p.log.success(
-        `Installed ${result.installed.map(({ name }) => pc.cyan(name)).join(', ')} from ${label}`
+        `Installed ${result.installed.map((name) => pc.cyan(name)).join(', ')} from ${label}`
       );
     }
     for (const failure of result.failed) p.log.error(failure);
@@ -1036,6 +1073,10 @@ export function parseSyncOptions(args: string[]): { options: SyncOptions } {
       options.cleanup = false;
     } else if (arg === '--no-remote') {
       options.remote = false;
+    } else if (arg === '--frozen-lockfile') {
+      options.frozenLockfile = true;
+    } else if (arg === '--no-frozen-lockfile') {
+      options.frozenLockfile = false;
     } else if (arg === '-r' || arg === '--recursive') {
       options.recursive = true;
     } else if (arg === '-a' || arg === '--agent') {

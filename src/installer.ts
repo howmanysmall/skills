@@ -518,9 +518,26 @@ function stripIgnoredEveFrontmatter(raw: string): string {
   return `---\n${frontmatter}\n---\n${content.replace(/^\r?\n/u, '')}`;
 }
 
-async function copyDirectory(src: string, dest: string, agentType?: AgentType): Promise<void> {
+/**
+ * Whether `target` (an absolute, symlink-resolved path) is the skill root itself
+ * or lives inside it. Both arguments must already be realpath-resolved so the
+ * prefix comparison is not defeated by `..` segments or intermediate symlinks.
+ */
+function isWithinRoot(root: string, target: string): boolean {
+  return target === root || target.startsWith(root + sep);
+}
+
+async function copyDirectory(
+  src: string,
+  dest: string,
+  agentType?: AgentType,
+  // Realpath of the skill's source root, threaded through recursion. Used to
+  // confine symlink dereferencing to the skill directory (see below).
+  skillRoot?: string
+): Promise<void> {
   await mkdir(dest, { recursive: true });
 
+  const confineRoot = skillRoot ?? (await realpath(src));
   const entries = await readdir(src, { withFileTypes: true });
 
   // Copy files and directories in parallel
@@ -532,9 +549,36 @@ async function copyDirectory(src: string, dest: string, agentType?: AgentType): 
         const destPath = join(dest, entry.name);
 
         if (entry.isDirectory()) {
-          await copyDirectory(srcPath, destPath, agentType);
+          await copyDirectory(srcPath, destPath, agentType, confineRoot);
         } else {
           try {
+            // We dereference symlinks below so the installed skill is
+            // self-contained after the temporary clone is cleaned up. A symlink
+            // can point anywhere, though, so a malicious skill could use one to
+            // copy arbitrary host files (e.g. `../../../.env`, `/etc/passwd`,
+            // `~/.ssh`) into the install tree, where a later deploy/push/publish
+            // would expose them. Only dereference links that stay inside the
+            // skill; skip (do not materialize) any that escape it. Note that
+            // `isDirectory()` is false for a symlink-to-directory, so those are
+            // handled here too, closing the directory-symlink vector as well.
+            // The archive/tar installer already rejects symlinks outright.
+            if (entry.isSymbolicLink()) {
+              let realTarget: string;
+              try {
+                realTarget = await realpath(srcPath);
+              } catch {
+                // Broken/dangling symlink (target does not exist).
+                console.warn(`Skipping broken symlink: ${srcPath}`);
+                return;
+              }
+              if (!isWithinRoot(confineRoot, realTarget)) {
+                console.warn(
+                  `Skipping symlink that points outside the skill directory: ${srcPath}`
+                );
+                return;
+              }
+            }
+
             if (agentType === 'eve' && entry.name.toLowerCase() === 'skill.md') {
               await writeFile(
                 destPath,
@@ -544,10 +588,11 @@ async function copyDirectory(src: string, dest: string, agentType?: AgentType): 
             }
 
             await cp(srcPath, destPath, {
-              // If the file is a symlink to elsewhere in a remote skill, it may not
+              // If the file is a symlink to elsewhere in the skill, it may not
               // resolve correctly once it has been copied to the local location.
               // `dereference: true` tells Node to copy the file instead of copying
               // the symlink. `recursive: true` handles symlinks pointing to directories.
+              // Links escaping the skill are already filtered out above.
               dereference: true,
               recursive: true,
             });
